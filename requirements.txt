@@ -1,9 +1,7 @@
 streamlit
 langgraph
 langchain
-langchain-google-genai
-google-generativeai
-langchain-groq
+langchain-openai>=1.0,<2
 sqlalchemy
 python-dotenv
 pydantic

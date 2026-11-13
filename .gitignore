@@ -8,3 +8,5 @@ __pycache__/
 demo/*.mp4
 .claude/
 RESUME_BULLETS.md
+
+.venv/

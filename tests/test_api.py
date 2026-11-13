@@ -72,3 +72,13 @@ def test_chat_reuses_provided_session_id_and_carries_history(monkeypatch):
 def test_chat_rejects_empty_message():
     response = client.post("/chat", json={"message": ""})
     assert response.status_code == 422
+
+
+def test_chat_unexpected_error_does_not_expose_credentials(monkeypatch):
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("Authorization: Bearer test-secret-credential")
+
+    monkeypatch.setattr(api, "run_orchestrator", fail)
+    response = client.post("/chat", json={"message": "Where is order 1001?"})
+    assert response.status_code == 502
+    assert "test-secret-credential" not in response.text

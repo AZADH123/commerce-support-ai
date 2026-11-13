@@ -48,3 +48,24 @@ def test_call_with_retry_escalates_after_exhausting_attempts():
     assert escalation["escalated"] is True
     assert "ticket_id" in escalation
     assert attempts["count"] == 2
+
+
+def test_retry_omits_provider_exception_body(monkeypatch, capsys):
+    from src import errors
+
+    contexts = []
+
+    def escalate(**kwargs):
+        contexts.append(kwargs)
+        return {"escalated": True}
+
+    def fail():
+        raise RuntimeError("Authorization: Bearer test-secret-credential")
+
+    monkeypatch.setattr(errors, "escalate_to_human", escalate)
+    call_with_retry(fail, max_attempts=2, backoff_seconds=0,
+                    escalate_reason="provider failed", escalate_context="order lookup")
+    captured = capsys.readouterr()
+    assert "test-secret-credential" not in captured.out + captured.err
+    assert "test-secret-credential" not in str(contexts)
+    assert "RuntimeError" in contexts[0]["context"]

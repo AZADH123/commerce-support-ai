@@ -13,6 +13,6 @@ COPY . .
 
 EXPOSE 8501
 
-# GEMINI_API_KEY (and optionally GEMINI_API_KEYS / GROQ_API_KEY) are provided
-# at runtime: docker run -e GEMINI_API_KEY=... -p 8501:8501 support-agent
+# DEEPSEEK_API_KEY is provided at runtime:
+# docker run -e DEEPSEEK_API_KEY -p 8501:8501 support-agent
 CMD ["sh", "-c", "python -m src.backend.seed && streamlit run app.py --server.port=8501 --server.address=0.0.0.0"]

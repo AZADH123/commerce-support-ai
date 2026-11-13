@@ -95,8 +95,8 @@ def chat(req: ChatRequest):
     augmented_message = memory.context_note() + req.message
     try:
         result = run_orchestrator(augmented_message, history=memory.turns)
-    except Exception as exc:  # pragma: no cover - orchestrator already retries + escalates internally
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except Exception:  # orchestrator already retries + escalates internally
+        raise HTTPException(status_code=502, detail="Support service unavailable; please try again later.") from None
 
     memory.add_turn(req.message, result["reply"])
     memory.update_last_order_id(result["trace"])

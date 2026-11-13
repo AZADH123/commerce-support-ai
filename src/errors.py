@@ -15,9 +15,10 @@ def call_with_retry(fn, *, max_attempts: int = 2, backoff_seconds: float = 3.0, 
             return fn(), None
         except Exception as exc:  # noqa: BLE001 - deliberately broad: any agent/LLM failure should escalate, not crash
             last_exc = exc
-            logger.warning("Attempt %d/%d failed: %s", attempt, max_attempts, exc)
+            # Provider exception bodies may contain credentials or request headers.
+            logger.warning("Attempt %d/%d failed (%s)", attempt, max_attempts, type(exc).__name__)
             if attempt < max_attempts:
                 time.sleep(backoff_seconds)
 
-    escalation = escalate_to_human(reason=escalate_reason, context=f"{escalate_context} | error: {last_exc}")
+    escalation = escalate_to_human(reason=escalate_reason, context=f"{escalate_context} | error type: {type(last_exc).__name__}")
     return None, escalation

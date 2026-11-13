@@ -7,9 +7,8 @@ with a mocked LLM — this harness measures actual LLM classification quality
 against a curated dataset, including deliberately tricky/ambiguous messages.
 
 Run:  python eval/run_eval.py            (calls the real LLM, one request per
-                                           message; needs GEMINI_API_KEY or
-                                           GROQ_API_KEY; respects --sleep to
-                                           stay under free-tier rate limits)
+                                           message; needs DEEPSEEK_API_KEY;
+                                           respects --sleep between requests)
       python eval/run_eval.py --dry-run  (no API calls; validates the dataset
                                            and prints what would run)
 """

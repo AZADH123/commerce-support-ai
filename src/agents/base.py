@@ -6,7 +6,7 @@ _EMPTY_USAGE = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
 
 def as_text(content) -> str:
-    """Gemini sometimes returns content as a list of typed blocks instead of a plain string."""
+    """Normalize plain text or typed text blocks from a chat model."""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -74,8 +74,7 @@ def run_tool_agent(
     reply = as_text(ai_msg.content).strip()
     if not reply and trace:
         # Some models occasionally exhaust tool-call rounds without ever
-        # emitting closing text (seen with Groq/Llama under long conversation
-        # history) - fall back to the last tool result rather than show
+        # emitting closing text - fall back to the last tool result rather than show
         # the customer a blank reply.
         last_result = trace[-1]["result"]
         reply = last_result if isinstance(last_result, str) else str(last_result)
