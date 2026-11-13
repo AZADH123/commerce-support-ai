@@ -1,23 +1,33 @@
 """FastAPI backend for the AI Customer Support Agent.
 
-Exposes the same multi-agent orchestration logic as the Streamlit UI over a
-clean JSON API, so the system can be consumed by any frontend, mobile app, or
-another service. Endpoints:
+Entry point: ``uvicorn api:app``.
 
-    GET  /health   liveness check
-    POST /chat     send a message, get back the agent's reply + trace + usage
+Endpoints:
+    GET  /health                     liveness check (no auth)
+    GET  /api/auth/config            public OIDC config for the browser PKCE flow
+    GET  /api/me                     authenticated identity
+    POST /chat                       main chat endpoint (authenticated, owner-scoped)
+    GET  /api/orders                 customer's own orders (read-only)
+    GET  /api/conversations          customer's conversation history
+    GET  /api/conversations/{id}     one conversation's messages
+    GET  /api/cases                  customer's refund/escalation cases
+    GET  /api/cases/{id}             case detail + audit events
+    GET  /api/review/cases           reviewer queue (pagination + filters)
+    GET  /api/review/cases/{id}      reviewer case detail
+    POST /api/review/cases/{id}/approve   reviewer approval
+    POST /api/review/cases/{id}/reject    reviewer rejection
 """
 
 import logging
 import time
-import uuid
 
-from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
+from src.api.routes import api_router
+from src.api.routes.chat import router as chat_router
 from src.logging_config import configure_logging
-from src.memory import ConversationMemory
-from src.orchestrator import run_orchestrator
+from src.services.exceptions import ServiceError
 
 configure_logging()
 logger = logging.getLogger("support_agent.api")
@@ -25,42 +35,11 @@ logger = logging.getLogger("support_agent.api")
 app = FastAPI(
     title="AI Customer Support Agent API",
     description=(
-        "Multi-agent customer support system: an orchestrator routes each message "
-        "to a specialist (order/refund/payment/FAQ) agent that calls real backend tools."
+        "Multi-agent customer support system with OIDC authentication, "
+        "owner-scoped orders/payments/conversations/cases, and durable refund review."
     ),
-    version="1.0.0",
+    version="2.0.0",
 )
-
-# In-memory conversation store keyed by session_id. A real deployment would
-# back this with Redis/a database; in-memory is fine for a single-process demo.
-_sessions: dict[str, ConversationMemory] = {}
-
-
-class ChatRequest(BaseModel):
-    message: str = Field(..., min_length=1, description="The customer's message")
-    session_id: str | None = Field(None, description="Omit to start a new conversation")
-
-
-class ToolCall(BaseModel):
-    agent: str
-    tool: str
-    args: dict
-    result: dict | str | None = None
-
-
-class Usage(BaseModel):
-    input_tokens: int = 0
-    output_tokens: int = 0
-    total_tokens: int = 0
-
-
-class ChatResponse(BaseModel):
-    session_id: str
-    reply: str
-    agent: str
-    trace: list[ToolCall]
-    usage: Usage
-    cached: bool = False
 
 
 @app.middleware("http")
@@ -87,25 +66,10 @@ def health():
     return {"status": "ok"}
 
 
-@app.post("/chat", response_model=ChatResponse)
-def chat(req: ChatRequest):
-    session_id = req.session_id or uuid.uuid4().hex
-    memory = _sessions.setdefault(session_id, ConversationMemory())
+@app.exception_handler(ServiceError)
+async def service_error_handler(_request: Request, exc: ServiceError):
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
 
-    augmented_message = memory.context_note() + req.message
-    try:
-        result = run_orchestrator(augmented_message, history=memory.turns)
-    except Exception:  # orchestrator already retries + escalates internally
-        raise HTTPException(status_code=502, detail="Support service unavailable; please try again later.") from None
 
-    memory.add_turn(req.message, result["reply"])
-    memory.update_last_order_id(result["trace"])
-
-    return ChatResponse(
-        session_id=session_id,
-        reply=result["reply"],
-        agent=result["agent"],
-        trace=result["trace"],
-        usage=Usage(**(result.get("usage") or {})),
-        cached=result.get("cached", False),
-    )
+app.include_router(chat_router)
+app.include_router(api_router)

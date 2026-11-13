@@ -1,4 +1,8 @@
-# AI Customer Support Agent — container image for the Streamlit app.
+# AI Customer Support Agent — container image for the FastAPI backend.
+#
+# The React frontend is built separately (frontend/) and served by a static
+# server or Vite; this image runs the API. Local PostgreSQL + Keycloak are
+# provided by docker-compose.yml.
 FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -11,8 +15,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-EXPOSE 8501
+EXPOSE 8000
 
-# DEEPSEEK_API_KEY is provided at runtime:
-# docker run -e DEEPSEEK_API_KEY -p 8501:8501 support-agent
-CMD ["sh", "-c", "python -m src.backend.seed && streamlit run app.py --server.port=8501 --server.address=0.0.0.0"]
+# DEEPSEEK_API_KEY / DATABASE_URL / OIDC_* are provided at runtime.
+CMD ["sh", "-c", "alembic upgrade head && python -m src.backend.seed && uvicorn api:app --host 0.0.0.0 --port 8000"]

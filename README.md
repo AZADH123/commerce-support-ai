@@ -1,229 +1,327 @@
-# AI Customer Support Agent (Multi-Agent)
+# AI Customer Support Agent — Phase 2 (Payments · Reliability · Policy KB)
 
-![CI](https://github.com/Pragatheswar-72/support-agent/actions/workflows/ci.yml/badge.svg)
-![Python](https://img.shields.io/badge/python-3.11-blue)
-![License: MIT](https://img.shields.io/badge/license-MIT-green)
-
-A multi-agent customer-support system for an e-commerce store. An orchestrator
-routes each request to a specialist agent (orders, refunds, payments, FAQ) that
-calls real backend tools to resolve it — with guardrails, error handling, and
-automatic human-escalation on failure.
-
-## Live demo
-
-**▶️ Live app:** https://support-agent-htg6lfc8qdjeez9bhx8b9o.streamlit.app/
-(free-tier hosting — if it shows "app went to sleep," click "Yes, get this app
-back up," it wakes in under a minute)
-
-## Screenshots
-
-| Order lookup | Guardrail refusal |
-|:---:|:---:|
-| ![Order lookup](demo/01_order_lookup.png) | ![Guardrail refusal](demo/02_guardrail_refusal.png) |
-
-| Guardrail enforced at the tool level | FAQ answer + session stats |
-|:---:|:---:|
-| ![Trace showing eligibility check](demo/02b_guardrail_trace_expanded.png) | ![FAQ and sidebar](demo/03_faq_and_sidebar.png) |
-
-The right-hand pair shows the actual mechanism: `check_refund_eligibility`
-returns `"eligible": false` for a shipped (not delivered) order, so
-`initiate_refund` never even attempts the refund — the rule is enforced in
-the tool's code, not just requested in a prompt.
-
-| FastAPI interactive docs (`/docs`) | Real `/chat` request + response |
-|:---:|:---:|
-| ![API docs](demo/04_api_docs_endpoint.png) | ![API response](demo/04b_api_docs_response.png) |
-
-Same orchestrator, different front door: this is the identical order-lookup
-request from the screenshot above, but made directly against the REST API
-instead of the chat UI — same reply, same tool trace, same backend.
-
-## What it does
-
-- Understands natural-language support requests
-- Routes to the right specialist agent (LangGraph orchestration)
-- Calls tools that read **and modify** a backend (order status, refunds, payments)
-- Remembers context across turns (e.g. "refund it" resolves to the last order discussed)
-- Enforces guardrails at the tool level (e.g. refunds only on delivered orders)
-- Handles errors with a retry, then escalates to a human with a ticket ID
-- Shows a live agent trace: which agent handled the request and which tools it called
-- Tracks token usage per session and caches repeated FAQ answers to save quota
-- Exposes the same orchestrator over a **FastAPI** REST endpoint, not just the chat UI
-- Ships with a **routing evaluation harness** that measures LLM classification accuracy on a curated dataset, separate from unit tests
-
-## Tech
-
-LangGraph multi-agent orchestration · DeepSeek V4.1 Flash tool-calling (official API)
-· SQLite backend (SQLAlchemy) · Streamlit · FastAPI · pytest
+A multi-agent customer-support system. A LangGraph orchestrator routes each
+message to a specialist (orders, refunds, payments, FAQ) that calls real
+backend tools. Phase 1 added PostgreSQL, Keycloak OIDC, owner-scoped data, and a
+durable refund review workflow. **Phase 2** executes reviewer-approved refunds
+through a payment sandbox, makes execution reliable (transactional outbox,
+Taskiq/Redis workers, idempotency, reconciliation), reconciles provider
+webhooks, notifies customers through Mailpit, and answers FAQ questions from a
+versioned pgvector policy knowledge base with structured citations.
 
 ## Architecture
 
 ```
-              Streamlit UI (app.py)   FastAPI (api.py)
-                        |                   |
-                        +--------+----------+
-                                 v
-                   +--------------------+
-                   |   ORCHESTRATOR     |  <- classifies intent, routes,
-                   |   (LangGraph)      |     holds conversation memory
-                   +---------+----------+
-        +----------+---------+----------+-----------+
-        v          v         v          v            v
-   +--------+ +--------+ +--------+ +--------+  (no match / fails)
-   | ORDER  | | REFUND | |PAYMENT | |  FAQ   |        |
-   | agent  | | agent  | | agent  | | agent  |        v
-   +---+----+ +---+----+ +---+----+ +---+----+   +----------+
-       | tools    | tools    | tools    |        | ESCALATE |
-       v          v          v          v        | to human |
-   +---------------------------------------+     +----------+
-   |   SQLite backend                      |
-   |   orders / payments / refunds tables  |
-   +---------------------------------------+
+                React SPA (frontend/, Vite + TS + Router + TanStack Query)
+                        |  Authorization: Bearer <access_token> (memory only)
+                        v
+   +-------------------- FastAPI (api.py) --------------------------------+
+   |  /chat   /api/orders /api/conversations /api/cases /api/review/*     |
+   |  /api/auth/config /api/me   /api/webhooks/stripe (signature-verified)|
+   |  OIDC validation | owner scoping | reviewer authorization            |
+   +----+---------------------+---------------------------+---------------+
+        |                     |                           |
+        v                     v                           v
+  agent orchestration   business services           persistence
+  src/orchestrator.py   src/services/*              src/backend/models.py
+  src/agents/*          - cases / refund_execution   SQLAlchemy + Alembic
+  src/tools.py          - webhooks / notifications          |
+                        - conversations                      v
+        |                     |                    PostgreSQL (pgvector image)
+        |                     +--> outbox_events ----> Dispatcher
+        |                     |                              |
+        v                     v                              v
+   DeepSeek chat         policy knowledge base         Redis -> Taskiq workers
+   (unchanged)           policy_documents/chunks      - refund execution
+                         (portable vector column)      - notification delivery
+                                                              |
+                        Stripe test mode  <---- payment adapter |--> Mailpit SMTP
+                        (or local adapter)                     (UI :8025)
 ```
 
-## How it works
-
-1. The orchestrator (a LangGraph graph) classifies the message into ORDER,
-   REFUND, PAYMENT, FAQ, or ESCALATE.
-2. The matching specialist agent decides which tool(s) to call and with what
-   arguments (DeepSeek tool-calling), then turns the tool result into a
-   natural-language reply.
-3. Tools read from and write to a SQLite database — refunds and payments are
-   real state changes, not simulated text.
-4. Guardrails are enforced in the tools themselves (not just the prompt): for
-   example `initiate_refund` always re-checks eligibility before acting, so
-   an LLM can't talk its way around the rule.
-5. If the whole pipeline fails (e.g. an API outage or rate limit), it retries
-   once, then calls `escalate_to_human`, which returns a ticket ID instead of
-   crashing.
-6. Conversation memory tracks the last order discussed, so follow-up messages
-   like "refund it" resolve correctly across agent switches.
-
-## Run locally
-
-1. `python -m venv venv` and activate it
-   (`.\venv\Scripts\Activate.ps1` on Windows, `source venv/bin/activate` on macOS/Linux).
-2. `pip install -r requirements.txt`
-3. For a new setup, copy `.env.example` to `.env` and replace the
-   `DEEPSEEK_API_KEY` placeholder with your official DeepSeek API key.
-   If `.env` already exists, edit only the needed settings; do not overwrite it.
-4. `python -m src.backend.seed` — creates and seeds the SQLite database.
-5. `streamlit run app.py`
-
-## Run the API (FastAPI)
+## Refund case state diagram
 
 ```
-uvicorn api:app --reload
+                              reviewer approve (one transaction)
+  PENDING_REVIEW ───────────────────────────────────────────────► APPROVED
+        │                                                             │
+        │ reviewer reject                                             │ dispatcher -> worker
+        v                                                             v
+     REJECTED                                                     PROCESSING
+                                                                      │
+                    provider success / webhook reconcile              │
+              ┌───────────────────────────────────────────────────────┤
+              v                                                       │
+          REFUNDED  ◄──────── late provider success ──────────────── NEEDS_ATTENTION
+        (terminal)                                                   ^
+                                                                     │
+                              permanent failure / ambiguous outcome /│
+                              missing payment reference / mismatch  ─┘
 ```
 
-Then open interactive docs at http://localhost:8000/docs. Example flow:
+## What changed in Phase 2
 
-```bash
-curl -X POST http://localhost:8000/chat \
-  -H "Content-Type: application/json" \
-  -d '{"message": "where is order 1001?"}'
+- **Commerce/payment adapters** — `src/integrations/commerce.py`
+  (deterministic order/ownership lookup) and `src/integrations/payments.py`
+  (`LocalPaymentAdapter` + concrete `StripePaymentAdapter` test mode). Provider
+  submission lives only in the authorized execution service.
+- **Durable execution** — `src/services/refund_execution.py`: approval writes
+  the case transition, the single `RefundAction`, and the outbox record in one
+  transaction; a dispatcher (`src/outbox/dispatcher.py`,
+  `python -m src.tasks.dispatch`) and Taskiq/Redis worker execute it.
+- **Webhook reconciliation** — `POST /api/webhooks/stripe` verifies the raw-body
+  signature, deduplicates event ids, validates action/payment/amount/currency,
+  and never regresses a finalized case.
+- **Notifications** — durable `Notification` rows + outbox, delivered by a
+  worker over SMTP to Mailpit.
+- **Policy knowledge base** — versioned policies with pgvector embeddings,
+  ingestion CLI, active-version selection, structured citations in `/chat`, and
+  the policy version recorded on each refund case.
+- **React** — policy citations in chat, a customer case timeline
+  (APPROVED → PROCESSING → REFUNDED / NEEDS_ATTENTION) with bounded polling, and
+  reviewer execution/recovery visibility. OpenAPI types regenerated.
 
-# reuse the returned session_id to keep conversation memory across turns
-curl -X POST http://localhost:8000/chat \
-  -H "Content-Type: application/json" \
-  -d '{"message": "refund it, it arrived broken", "session_id": "<id from above>"}'
-```
+## Prerequisites
 
-Every request is logged as structured JSON (method, path, status, latency).
-The Streamlit UI and the API both call the same `src/orchestrator.py`, so the
-agent logic is written once and consumed by either a human (UI) or a machine
-(API).
+- Python 3.11+ (tested 3.12), Node 20+, npm, Docker.
 
-## Tests
-
-```
-pytest
-```
-
-Tests cover: every tool against a seeded in-memory database (including
-the refund-eligibility guardrail), orchestrator routing for all five paths
-(mocked LLM, no API key needed), conversation memory, retry/escalation
-behavior on a forced failure, the FastAPI endpoints (session handling,
-validation, mocked orchestrator), DeepSeek request configuration and a complete tool-call round trip with mocked HTTP,
-and a regression test for a real bug found
-during manual testing (a model looping on a tool call without ever
-answering — see the commit history for the fix).
-
-## Evaluation
-
-A routing evaluation harness measures whether the router LLM classifies
-realistic (and deliberately tricky) customer messages correctly — this is
-different from the unit tests, which only check the graph wiring with a
-mocked LLM:
-
-```
-python eval/run_eval.py --dry-run   # validates the dataset, no API calls
-python eval/run_eval.py             # calls the real LLM, reports accuracy
-```
-
-The bundled 21-scenario dataset (`eval/eval_dataset.json`) can be used to
-measure routing accuracy for your configured DeepSeek model. Live evaluation
-requires `DEEPSEEK_API_KEY`; unit tests and `--dry-run` require no API key.
-
-## Docker
-
-```
-docker build -t support-agent .
-docker run -p 8501:8501 -e DEEPSEEK_API_KEY support-agent
-```
-
-## Deploy (Streamlit Community Cloud)
-
-1. Push this repo to GitHub.
-2. On https://share.streamlit.io, create an app from the repo, main file `app.py`.
-3. In the app's **Secrets**, add:
-   ```
-   DEEPSEEK_API_KEY = "your_key_here"
-   DEEPSEEK_MODEL = "deepseek-flash"   # optional
-   ```
-   Never commit the real key — `.env` is git-ignored.
-4. That's it — the SQLite file isn't committed to the repo, but `src/tools.py`
-   auto-seeds the database on first import if it's empty, so a fresh
-   deployment works with no extra startup step.
-
-## Cost
-
-DeepSeek API usage is billed to your DeepSeek account. FAQ-answer caching
-reduces repeat specialist calls. Check your provider account for current pricing.
-
-## Configuration
-
-- `DEEPSEEK_API_KEY` - required, loaded from the environment or local `.env`.
-- `DEEPSEEK_MODEL` - optional, defaults to `deepseek-flash` (DeepSeek V4.1 Flash).
-
-The router and every specialist share `get_llm()`, using `ChatOpenAI` from
-`langchain-openai` with the explicit DeepSeek key and
-`https://api.deepseek.com` Chat Completions endpoint. Thinking is disabled
-on every request with `extra_body={"thinking": {"type": "disabled"}}`, including
-requests with tools. See the [official DeepSeek tool-call example](https://api-docs.deepseek.com/guides/tool_calls/).
-Each provider call has a 60-second timeout and no SDK retries; the existing
-orchestrator retries the pipeline once, then escalates on failure. Provider
-exception bodies are omitted from retry logs and escalation context.
-
-## Windows PowerShell
-
-Run from the repository directory. Stop an existing FastAPI process with
-Ctrl+C in its terminal, then install dependencies and restart:
+## Quick start (PowerShell)
 
 ```powershell
+# 1. Infrastructure: PostgreSQL+pgvector, Redis, Mailpit, Keycloak
+docker compose up -d
+
+# 2. Python environment
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe -m pytest -q
+
+# 3. Configure environment (do not overwrite an existing .env)
+Copy-Item .env.example .env   # set DEEPSEEK_API_KEY; keep PAYMENT_PROVIDER=local for the deterministic demo
+
+# 4. Schema, demo data, policies
+.\.venv\Scripts\python.exe -m alembic upgrade head
+.\.venv\Scripts\python.exe -m src.backend.seed
+.\.venv\Scripts\python.exe -m src.knowledge.ingest
+
+# 5. API (terminal 1)
 .\.venv\Scripts\python.exe -m uvicorn api:app --reload
+
+# 6. Outbox dispatcher (terminal 2)
+.\.venv\Scripts\python.exe -m src.tasks.dispatch --loop
+
+# 7. Taskiq worker (terminal 3)
+.\.venv\Scripts\taskiq.exe worker src.tasks.broker:broker src.tasks.refund_tasks
+
+# 8. Frontend (terminal 4)
+cd frontend
+npm install
+npm run dev
 ```
 
-For a new environment, first run `python -m venv .venv`. Configure
-`DEEPSEEK_API_KEY` in your local `.env` before making live requests. In another
-PowerShell terminal, run this read-only order lookup:
+Open http://localhost:5173 (Mailpit UI: http://localhost:8025).
+
+> **pgvector note:** Phase 2 requires the `pgvector/pgvector:pg16` image (the
+> bundled compose file). A Postgres volume created by a plain `postgres` image
+> does not have the `vector` extension; either install it in that database or
+> recreate the **dev** volume with `docker compose down -v` (this deletes local
+> demo data only).
+
+## Demo users
+
+Keycloak realm `support`, client `commerce-support-web`; password `password`.
+
+| User                   | Role     | Orders owned |
+|------------------------|----------|--------------|
+| `alice@example.com`    | customer | 1001 (delivered), 1002 (shipped), 1003 (placed) |
+| `bob@example.com`      | customer | 1004 (delivered), 1005 (cancelled), 1006 (delivered) |
+| `reviewer@example.com` | reviewer | — |
+
+## Environment variables
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `DEEPSEEK_API_KEY` | — | DeepSeek chat key (required for live chat) |
+| `DEEPSEEK_MODEL` | `deepseek-flash` | Chat model id |
+| `DATABASE_URL` | compose Postgres | SQLAlchemy URL (falls back to `SUPPORT_AGENT_DB_URL`, then SQLite) |
+| `OIDC_ISSUER` / `OIDC_AUDIENCE` / `OIDC_CLIENT_ID` | local Keycloak realm | OIDC validation |
+| `OIDC_REVIEWER_ROLE` | `reviewer` | Realm role for staff |
+| `PAYMENT_PROVIDER` | `local` | `local` (deterministic) or `stripe` (test mode) |
+| `STRIPE_SECRET_KEY` | — | Stripe **test** secret (`sk_test_...`) |
+| `STRIPE_WEBHOOK_SECRET` | — | Stripe webhook signing secret (`whsec_...`) |
+| `REDIS_URL` | `redis://localhost:6379/0` | Taskiq broker |
+| `EMAIL_TRANSPORT` | `memory` | `smtp` for Mailpit, `memory` for tests |
+| `SMTP_HOST` / `SMTP_PORT` / `SMTP_SENDER` | `localhost` / `1025` / no-reply | Mailpit SMTP |
+| `EMBEDDING_PROVIDER` | `hashing` | `hashing` (offline) or `openai` |
+| `EMBEDDING_DIM` | `384` | Must match the embedding model / vector column |
+
+Frontend public config: `VITE_OIDC_REDIRECT_URI` (optional; defaults to
+`{origin}/callback`). No secrets belong in `VITE_*`.
+
+## Payment provider: Stripe test mode
+
+**Selected provider:** Stripe test mode, called directly over the Stripe HTTP
+API (no SDK dependency). The adapter sends an `Idempotency-Key` of
+`refund-case-<case_id>` and never trusts model-generated amounts or references.
+
+Account setup (sandbox only):
+
+1. Create a Stripe account and stay in **test mode**.
+2. Copy the test secret key (`sk_test_...`) into `STRIPE_SECRET_KEY`.
+3. Provision a synthetic test payment for the demo order:
+   ```powershell
+   $env:STRIPE_SECRET_KEY = "sk_test_..."
+   .\.venv\Scripts\python.exe scripts\stripe_provision.py --order 1001
+   ```
+   This creates a confirmed test PaymentIntent and points order 1001's payment
+   row at it (`provider=stripe`).
+4. Forward webhooks and copy the printed signing secret into
+   `STRIPE_WEBHOOK_SECRET` (`whsec_...`):
+   ```powershell
+   stripe listen --forward-to http://localhost:8000/api/webhooks/stripe
+   ```
+5. Set `PAYMENT_PROVIDER=stripe` and restart the API and worker.
+
+For a fully deterministic local demo, keep `PAYMENT_PROVIDER=local`; the local
+adapter succeeds in-process and needs no network or credentials.
+
+## Reliability model
+
+- **Approval transaction** — `PENDING_REVIEW → APPROVED`, the `APPROVED` audit
+  event, the single `RefundAction` (unique `case_id`), and the `refund.approved`
+  outbox row commit together.
+- **Stable idempotency key** — derived from the case id and reused on every
+  retry, so the provider never creates a second refund.
+- **Duplicate jobs** — a worker claims `PENDING/RETRYABLE → SUBMITTING` with a
+  compare-and-swap; an already-`SUCCEEDED`/terminal action is a no-op.
+- **Retryable vs permanent vs uncertain** — retryable re-enqueues with backoff;
+  permanent moves the case to `NEEDS_ATTENTION`; uncertain outcomes are
+  reconciled against the provider before resubmitting, and unresolved ones
+  become `NEEDS_ATTENTION`.
+- **Worker crash after provider acceptance** — the action stays `SUBMITTING`;
+  the dispatcher's stale recovery re-enqueues it, and execution reconciles the
+  provider result instead of resubmitting.
+- **Dispatcher recovery of unsent outbox rows** — nothing is deleted on
+  dispatch; `PENDING` rows are re-dispatched on every pass, with backoff and a
+  `FAILED` ceiling after repeated enqueue failures.
+
+## Webhooks
+
+`POST /api/webhooks/stripe` verifies the `Stripe-Signature` HMAC over the exact
+raw request body (with a timestamp tolerance), deduplicates `(provider,
+event_id)`, and validates the provider, payment reference, amount, and currency
+against the stored `RefundAction` before applying any transition. Late,
+duplicate, and out-of-order events are acknowledged without regressing a
+finalized case; a late success can still recover a `NEEDS_ATTENTION` case.
+
+## Notifications
+
+Every case update creates a durable `Notification` row plus an outbox event; the
+notification worker sends it over SMTP. Locally, Mailpit captures mail at
+http://localhost:8025. Delivery is **at-least-once**: a status CAS prevents
+duplicate sends on retry, and SMTP has no provider idempotency, so a crash after
+the provider accepts but before the local `SENT` commit can resend.
+
+## Policy knowledge base
+
+- Tables: `policy_documents` (store, topic, title, version, effective date,
+  source, content, active) and `policy_chunks` (chunk index, text, vector).
+- **Embeddings are configured separately from DeepSeek chat.** Default
+  `hashing` embedder: deterministic, offline, **384 dimensions**. To use a real
+  model, set `EMBEDDING_PROVIDER=openai`, `EMBEDDING_BASE_URL`,
+  `EMBEDDING_API_KEY`, `EMBEDDING_MODEL=text-embedding-3-small`, and
+  `EMBEDDING_DIM=1536`.
+- Ingestion is repeatable:
+  ```powershell
+  .\.venv\Scripts\python.exe -m src.knowledge.ingest
+  .\.venv\Scripts\python.exe -m src.knowledge.ingest --reindex   # force re-embedding
+  ```
+  Changing the embedding model/dimension requires a migration (or recreating the
+  vector column), then `--reindex`.
+- Only the highest **effective** version per `(store, topic)` is active.
+  Retrieval returns structured citations (document id, title, version, source,
+  effective date, chunk index, snippet, score). Retrieved text is treated as
+  untrusted content; refund eligibility remains a business rule, and the active
+  refund policy version is recorded on each case.
+
+## API
+
+| Method | Path | Auth | Purpose |
+|--------|------|------|---------|
+| GET  | `/health` | — | Liveness |
+| GET  | `/api/auth/config` | — | Public OIDC config (PKCE) |
+| GET  | `/api/me` | any | Identity |
+| POST | `/chat` | any | Chat (owner-scoped; returns `citations`) |
+| GET  | `/api/orders` | any | Own orders |
+| GET  | `/api/conversations` / `/{id}` | any | Own conversations |
+| GET  | `/api/cases` / `/{id}` | any | Own cases + timeline + `execution_status` |
+| GET  | `/api/review/cases` | reviewer | Queue (pagination + filters) |
+| GET  | `/api/review/cases/{id}` | reviewer | Case + `action`, `notifications`, `outbox` |
+| POST | `/api/review/cases/{id}/approve` | reviewer | Approve (creates action + outbox) |
+| POST | `/api/review/cases/{id}/reject` | reviewer | Reject (reason required) |
+| POST | `/api/webhooks/stripe` | signature | Provider webhook reconciliation |
+
+## Tests & verification
+
+Backend (deterministic, from repo root):
 
 ```powershell
-$body = @{ message = "Where is order 1001?" } | ConvertTo-Json
-$result = Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8000/chat" -ContentType "application/json" -Body $body
-$result | ConvertTo-Json -Depth 10
-if ($result.agent -ne "order") { throw "Expected order agent" }
-if (-not ($result.trace | Where-Object { $_.tool -in @("get_order_status", "get_order_details", "track_shipment") -and $_.args.order_id -eq 1001 })) { throw "Expected order 1001 lookup in trace" }
+.\.venv\Scripts\python.exe -m pytest -q
 ```
+
+Frontend (from `frontend/`):
+
+```powershell
+npm run typecheck
+npm run lint
+npm test
+npm run build
+```
+
+Deterministic coverage includes: duplicate jobs, concurrent approval, invalid
+webhook signatures, delayed/out-of-order events, uncertain refund outcomes,
+worker crash after provider acceptance, outbox retry/recovery, active policy
+selection, citations, and notification retries.
+
+**Live sandbox checks** (require the Docker stack and, for Stripe, a test key):
+
+```powershell
+docker compose up -d
+.\.venv\Scripts\python.exe -m alembic upgrade head
+.\.venv\Scripts\python.exe -m src.backend.seed
+.\.venv\Scripts\python.exe -m src.knowledge.ingest
+.\.venv\Scripts\python.exe -m uvicorn api:app --reload
+.\.venv\Scripts\python.exe -m src.tasks.dispatch --loop
+cd frontend; npm run dev
+npx playwright install chromium
+npm run test:e2e
+```
+
+## Copyable demo (PowerShell)
+
+```powershell
+# Chat: policy citation
+$body = @{ message = "How long does shipping take?" } | ConvertTo-Json
+Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8000/chat" -ContentType "application/json" -Body $body |
+  Select-Object reply, citations
+```
+
+Then, in the React app: sign in as alice, ask for a refund on order 1001, sign
+out; sign in as reviewer, approve the case; sign back in as alice and watch the
+timeline reach **Refunded**. Mailpit (http://localhost:8025) shows the
+notification. With `PAYMENT_PROVIDER=local` the refund is deterministic; with
+Stripe test mode it exercises the sandbox and its webhooks.
+
+## Security notes
+
+- Tokens stay in memory (never URLs/persistent storage); identity and role come
+  from validated OIDC claims, never from model arguments or request bodies.
+- Customer responses redact tool internals and provider error bodies; reviewer
+  execution details are behind reviewer authorization.
+- Webhook signatures are verified over the raw body; event ids are deduplicated.
+- Keep `DEEPSEEK_API_KEY`, `STRIPE_SECRET_KEY`, and `STRIPE_WEBHOOK_SECRET` out of
+  Git; `.env` is git-ignored. No secrets are logged.
+
+## License
+
+MIT.

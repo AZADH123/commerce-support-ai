@@ -1,0 +1,8 @@
+node_modules/
+.npm-cache/
+dist/
+*.local
+.env.local
+.env.*.local
+src/api/schema.d.ts
+openapi.json

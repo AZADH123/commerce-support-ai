@@ -2,14 +2,8 @@ import json
 
 import httpx
 import pytest
-from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
-from sqlalchemy.pool import StaticPool
 
-import api
-from src import llm, tools
-from src.backend.db import get_session_factory
-from src.backend.seed import seed
+from src import llm
 
 
 @pytest.fixture
@@ -47,15 +41,12 @@ def test_missing_deepseek_key_is_clear(deepseek_env, monkeypatch, key):
         llm.get_llm()
 
 
-def test_chat_deepseek_wire_requests_and_tool_round_trip(deepseek_env, monkeypatch):
-    """Use real ChatOpenAI serialization, graph, tool and SQLite; mock only HTTP."""
-    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
-    monkeypatch.setattr(tools, "_engine", engine)
-    monkeypatch.setattr(tools, "_SessionLocal", get_session_factory(engine))
-    tools.configure_db(engine)
-    with get_session_factory(engine)() as session:
-        seed(session)
+def test_chat_deepseek_wire_requests_and_tool_round_trip(deepseek_env, client, monkeypatch):
+    """Use real ChatOpenAI serialization, graph, tools and SQLite; mock only HTTP.
 
+    The customer is Alice, who owns order 1001, so the ownership-scoped tool
+    returns the delivered status. The customer-facing response redacts tool args.
+    """
     requests = []
 
     def respond(request):
@@ -71,11 +62,17 @@ def test_chat_deepseek_wire_requests_and_tool_round_trip(deepseek_env, monkeypat
         elif len(requests) == 2:
             schemas = {t["function"]["name"]: t["function"] for t in body["tools"]}
             assert schemas["get_order_status"]["parameters"]["properties"]["order_id"]["type"] == "integer"
-            message = {"role": "assistant", "content": None, "tool_calls": [
-                {"id": "lookup-1001", "type": "function", "function": {
-                    "name": "get_order_status", "arguments": '{"order_id": 1001}'
-                }}
-            ]}
+            message = {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "lookup-1001",
+                        "type": "function",
+                        "function": {"name": "get_order_status", "arguments": '{"order_id": 1001}'},
+                    }
+                ],
+            }
         else:
             assert len(requests) == 3
             assistant, tool_result = body["messages"][-2:]
@@ -84,29 +81,40 @@ def test_chat_deepseek_wire_requests_and_tool_round_trip(deepseek_env, monkeypat
             assert tool_result["tool_call_id"] == "lookup-1001"
             assert "delivered" in tool_result["content"]
             message = {"role": "assistant", "content": "Your order 1001 has been delivered."}
-        return httpx.Response(200, json={
-            "id": f"chat-{len(requests)}", "object": "chat.completion", "created": 0,
-            "model": "deepseek-flash", "choices": [{"index": 0, "message": message,
-                "finish_reason": "tool_calls" if message.get("tool_calls") else "stop"}],
-            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
-        })
+        return httpx.Response(
+            200,
+            json={
+                "id": f"chat-{len(requests)}",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "deepseek-flash",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": message,
+                        "finish_reason": "tool_calls" if message.get("tool_calls") else "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            },
+        )
 
     original_client = llm.ChatOpenAI
     with httpx.Client(transport=httpx.MockTransport(respond)) as transport:
+
         def mock_client(**kwargs):
             return original_client(**kwargs, http_client=transport)
 
         monkeypatch.setattr(llm, "ChatOpenAI", mock_client)
-        with TestClient(api.app) as client:
-            response = client.post("/chat", json={"message": "Where is order 1001?"})
+        client.set_principal("alice")
+        response = client.post("/chat", json={"message": "Where is order 1001?"})
         assert response.status_code == 200
         result = response.json()
 
     assert len(requests) == 3
     assert result["agent"] == "order"
     assert result["reply"] == "Your order 1001 has been delivered."
-    assert result["trace"][0]["tool"] == "get_order_status"
-    assert result["trace"][0]["result"] == {"order_id": 1001, "status": "delivered"}
+    # Redacted trace: tool name and agent only, no internal args/results.
+    assert result["trace"] == [{"agent": "order", "tool": "get_order_status"}]
     assert result["usage"]["total_tokens"] == 45
     assert result["cached"] is False
-    engine.dispose()

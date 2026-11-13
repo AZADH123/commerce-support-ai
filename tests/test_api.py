@@ -1,8 +1,6 @@
-from fastapi.testclient import TestClient
+import json
 
-import api
-
-client = TestClient(api.app)
+from src.api.routes import chat as chat_route
 
 FAKE_RESULT = {
     "reply": "Your order 1001 has been delivered.",
@@ -20,65 +18,125 @@ FAKE_RESULT = {
 }
 
 
-def test_health():
-    response = client.get("/health")
-    assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
+def test_health_no_auth(client):
+    r = client.get("/health")
+    assert r.status_code == 200
+    assert r.json() == {"status": "ok"}
 
 
-def test_chat_returns_agent_reply_and_trace(monkeypatch):
-    monkeypatch.setattr(api, "run_orchestrator", lambda *_a, **_k: FAKE_RESULT)
+def test_auth_config_no_auth(client):
+    r = client.get("/api/auth/config")
+    assert r.status_code == 200
+    assert r.json()["client_id"] == "commerce-support-web"
 
-    response = client.post("/chat", json={"message": "where is order 1001?"})
 
-    assert response.status_code == 200
-    body = response.json()
+def test_me_requires_auth(client):
+    assert client.get("/api/me").status_code == 401
+
+
+def test_me_returns_identity(client):
+    client.set_principal("alice")
+    r = client.get("/api/me")
+    assert r.status_code == 200
+    assert r.json()["role"] == "customer"
+    assert r.json()["email"] == "alice@example.com"
+
+
+def test_chat_requires_auth(client):
+    assert client.post("/chat", json={"message": "hi"}).status_code == 401
+
+
+def test_chat_returns_redacted_trace(client, monkeypatch):
+    monkeypatch.setattr(chat_route, "run_orchestrator", lambda *a, **k: FAKE_RESULT)
+    client.set_principal("alice")
+    r = client.post("/chat", json={"message": "where is order 1001?"})
+    assert r.status_code == 200
+    body = r.json()
     assert body["reply"] == "Your order 1001 has been delivered."
-    assert body["agent"] == "order"
-    assert body["trace"][0]["tool"] == "get_order_status"
-    assert body["usage"]["total_tokens"] == 15
-    assert "session_id" in body
+    assert body["trace"] == [{"agent": "order", "tool": "get_order_status"}]
+    # Internal tool args/results must never reach the customer.
+    assert '"args"' not in json.dumps(body)
+    assert '"result"' not in json.dumps(body)
+    assert "conversation_id" in body
 
 
-def test_chat_generates_new_session_id_when_omitted(monkeypatch):
-    monkeypatch.setattr(api, "run_orchestrator", lambda *_a, **_k: FAKE_RESULT)
+def test_chat_restores_conversation_history(client, monkeypatch):
+    captured = []
 
-    r1 = client.post("/chat", json={"message": "hello"})
-    r2 = client.post("/chat", json={"message": "hello again"})
-
-    assert r1.json()["session_id"] != r2.json()["session_id"]
-
-
-def test_chat_reuses_provided_session_id_and_carries_history(monkeypatch):
-    captured_history = []
-
-    def fake_orchestrator(user_message, history=None):
-        captured_history.append(list(history or []))
+    def fake(user_message, history=None):
+        captured.append(list(history or []))
         return FAKE_RESULT
 
-    monkeypatch.setattr(api, "run_orchestrator", fake_orchestrator)
-
-    r1 = client.post("/chat", json={"message": "where is order 1001?", "session_id": "abc123"})
-    assert r1.json()["session_id"] == "abc123"
-
-    r2 = client.post("/chat", json={"message": "refund it", "session_id": "abc123"})
-    assert r2.json()["session_id"] == "abc123"
-
-    # second call's history should include the first turn (memory persisted across requests)
-    assert len(captured_history[0]) == 0
-    assert len(captured_history[1]) == 2
+    monkeypatch.setattr(chat_route, "run_orchestrator", fake)
+    client.set_principal("alice")
+    r1 = client.post("/chat", json={"message": "where is order 1001?"})
+    cid = r1.json()["conversation_id"]
+    r2 = client.post("/chat", json={"message": "refund it", "conversation_id": cid})
+    assert r2.json()["conversation_id"] == cid
+    assert len(captured[0]) == 0
+    assert len(captured[1]) == 2
 
 
-def test_chat_rejects_empty_message():
-    response = client.post("/chat", json={"message": ""})
-    assert response.status_code == 422
+def test_chat_rejects_empty_message(client):
+    client.set_principal("alice")
+    assert client.post("/chat", json={"message": ""}).status_code == 422
 
 
-def test_chat_unexpected_error_does_not_expose_credentials(monkeypatch):
-    def fail(*_args, **_kwargs):
+def test_chat_unexpected_error_does_not_expose_credentials(client, monkeypatch):
+    def fail(*_a, **_k):
         raise RuntimeError("Authorization: Bearer test-secret-credential")
 
-    monkeypatch.setattr(api, "run_orchestrator", fail)
-    response = client.post("/chat", json={"message": "Where is order 1001?"})
-    assert response.status_code == 502
-    assert "test-secret-credential" not in response.text
+    monkeypatch.setattr(chat_route, "run_orchestrator", fail)
+    client.set_principal("alice")
+    r = client.post("/chat", json={"message": "hi"})
+    assert r.status_code == 502
+    assert "test-secret-credential" not in r.text
+
+
+def test_cross_user_conversation_access_denied(client, monkeypatch):
+    monkeypatch.setattr(chat_route, "run_orchestrator", lambda *a, **k: FAKE_RESULT)
+    client.set_principal("alice")
+    cid = client.post("/chat", json={"message": "hi"}).json()["conversation_id"]
+    client.set_principal("bob")
+    assert client.get(f"/api/conversations/{cid}").status_code == 404
+
+
+def test_orders_scoped_to_owner(client):
+    client.set_principal("alice")
+    assert [o["order_id"] for o in client.get("/api/orders").json()] == [1001, 1002, 1003]
+    client.set_principal("bob")
+    assert [o["order_id"] for o in client.get("/api/orders").json()] == [1004, 1005, 1006]
+
+
+def test_review_endpoints_require_reviewer(client):
+    client.set_principal("alice")
+    assert client.get("/api/review/cases").status_code == 403
+    assert client.get("/api/review/cases/1").status_code == 403
+    assert client.post("/api/review/cases/1/approve", json={}).status_code == 403
+
+
+def test_reviewer_queue_and_decision_flow(client, case_factory):
+    case = case_factory("alice", 1001, "Arrived broken")
+    client.set_principal("reviewer")
+
+    queue = client.get("/api/review/cases").json()
+    assert queue["total"] == 1
+    assert queue["items"][0]["id"] == case.id
+    assert queue["items"][0]["status"] == "PENDING_REVIEW"
+
+    approved = client.post(f"/api/review/cases/{case.id}/approve", json={"reason": "Approved"}).json()
+    assert approved["status"] == "APPROVED"
+    assert approved["decision_reason"] == "Approved"
+    assert [e["transition"] for e in approved["events"]] == ["CREATED", "APPROVED"]
+
+    # Customer sees the decision on their own case detail.
+    client.set_principal("alice")
+    detail = client.get(f"/api/cases/{case.id}").json()
+    assert detail["status"] == "APPROVED"
+
+
+def test_reviewer_reject_requires_reason(client, case_factory):
+    case = case_factory("alice", 1001, "Arrived broken")
+    client.set_principal("reviewer")
+    r = client.post(f"/api/review/cases/{case.id}/reject", json={})
+    assert r.status_code == 422

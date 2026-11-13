@@ -1,0 +1,93 @@
+{
+  "realm": "support",
+  "enabled": true,
+  "sslRequired": "external",
+  "registrationAllowed": false,
+  "resetPasswordAllowed": false,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "verifyEmail": false,
+  "accessTokenLifespan": 300,
+  "roles": {
+    "realm": [
+      {
+        "name": "reviewer",
+        "description": "Staff member who can review and decide refund requests."
+      }
+    ]
+  },
+  "users": [
+    {
+      "id": "11111111-1111-1111-1111-111111111111",
+      "username": "alice",
+      "email": "alice@example.com",
+      "firstName": "Alice",
+      "lastName": "Chen",
+      "enabled": true,
+      "emailVerified": true,
+      "credentials": [
+        { "type": "password", "value": "password", "temporary": false }
+      ],
+      "realmRoles": [],
+      "clientRoles": {}
+    },
+    {
+      "id": "22222222-2222-2222-2222-222222222222",
+      "username": "bob",
+      "email": "bob@example.com",
+      "firstName": "Ben",
+      "lastName": "Torres",
+      "enabled": true,
+      "emailVerified": true,
+      "credentials": [
+        { "type": "password", "value": "password", "temporary": false }
+      ],
+      "realmRoles": [],
+      "clientRoles": {}
+    },
+    {
+      "id": "33333333-3333-3333-3333-333333333333",
+      "username": "reviewer",
+      "email": "reviewer@example.com",
+      "firstName": "Rita",
+      "lastName": "Reviewer",
+      "enabled": true,
+      "emailVerified": true,
+      "credentials": [
+        { "type": "password", "value": "password", "temporary": false }
+      ],
+      "realmRoles": ["reviewer"],
+      "clientRoles": {}
+    }
+  ],
+  "clients": [
+    {
+      "clientId": "commerce-support-web",
+      "name": "Commerce Support Web",
+      "enabled": true,
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": true,
+      "serviceAccountsEnabled": false,
+      "redirectUris": [
+        "http://localhost:5173/*",
+        "http://localhost:5173/callback"
+      ],
+      "webOrigins": ["http://localhost:5173"],
+      "protocolMappers": [
+        {
+          "name": "audience-support",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "commerce-support-web",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ]
+}
